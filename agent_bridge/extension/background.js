@@ -5,9 +5,14 @@
  *   • getPageState()    → returns {url, title, content} of the active tab
  *   • executeAction()   → performs navigate / click / type / key / scroll / wait
  *
- * The popup coordinates the agent loop by talking to the FastAPI server,
+ * The side panel coordinates the agent loop by talking to the FastAPI server,
  * then forwarding requests here via chrome.runtime.sendMessage().
  */
+
+// ── Open side panel on toolbar icon click ──────────────────────────────────────
+chrome.sidePanel
+  .setPanelBehavior({ openPanelOnActionClick: true })
+  .catch(() => {});  // API only available in Chrome 114+
 
 const SERVER = "http://127.0.0.1:8000";
 
@@ -276,9 +281,9 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   const task = info.selectionText?.trim()
     || `Summarize the main content of the current page (${tab.url})`;
 
-  // Open the popup programmatically
-  await chrome.action.openPopup?.().catch(() => {});
-
-  // Store the context menu task so popup can pick it up
+  // Store the task so the side panel can pick it up
   await chrome.storage.local.set({ contextMenuTask: task });
+
+  // Open the side panel
+  await chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
 });

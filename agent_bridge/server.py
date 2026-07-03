@@ -32,7 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from browser_use.llm import ChatAnthropic, ChatGoogle
+from browser_use.llm import ChatAnthropic, ChatGoogle, ChatGroq
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
@@ -56,15 +56,26 @@ def _build_llm(model: str):
 		if not key:
 			raise HTTPException(503, "GOOGLE_API_KEY not set in agent_bridge/.env")
 		return ChatGoogle(model=model, api_key=key)
-	key = os.getenv("ANTHROPIC_API_KEY")
-	if not key:
-		raise HTTPException(503, "ANTHROPIC_API_KEY not set in agent_bridge/.env")
-	return ChatAnthropic(model=model, api_key=key)
+	if model.startswith(("llama", "mixtral", "moonshard", "deepseek", "qwen", "compound")):
+		key = os.getenv("GROQ_API_KEY")
+		if not key:
+			raise HTTPException(503, "GROQ_API_KEY not set in agent_bridge/.env")
+		return ChatGroq(model=model, api_key=key)
+	if model.startswith("claude"):
+		key = os.getenv("ANTHROPIC_API_KEY")
+		if not key:
+			raise HTTPException(503, "ANTHROPIC_API_KEY not set in agent_bridge/.env")
+		return ChatAnthropic(model=model, api_key=key)
+	# fallback: try Groq (it hosts many open models)
+	key = os.getenv("GROQ_API_KEY")
+	if key:
+		return ChatGroq(model=model, api_key=key)
+	raise HTTPException(503, f"No API key configured for model '{model}'")
 
 
 SYSTEM_PROMPT = """You are a browser automation agent. Given a task and the current state of a browser tab, decide the SINGLE best next action.
 
-Output ONLY a valid JSON object — no markdown, no explanation, just the JSON.
+CRITICAL: Your ENTIRE response must be a single raw JSON object. No markdown. No backticks. No explanation. No text before or after. Start your response with { and end with }.
 
 Available actions:
   {"type": "navigate",  "url": "https://..."}
@@ -86,7 +97,7 @@ Rules:
 """
 
 
-async def _ask_llm(llm, task: str, step: int, max_steps: int, page_state: dict, history: list[dict]) -> dict:
+async def _ask_llm(llm, task: str, step: int, max_steps: int, page_state: dict, history: list[dict], _retry: int = 0) -> dict:
 	"""Call the LLM with page state and get the next action as a dict."""
 	history_text = ""
 	if history:
@@ -117,15 +128,53 @@ What is the next single action?"""
 	# Strip markdown fences if present
 	text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.MULTILINE)
 	text = re.sub(r"\s*```$", "", text.strip(), flags=re.MULTILINE)
+	text = text.strip()
 
+	# Attempt 1: direct parse
 	try:
-		return json.loads(text.strip())
+		return json.loads(text)
 	except json.JSONDecodeError:
-		# Try to extract JSON from the response
-		m = re.search(r"\{.*\}", text, re.DOTALL)
-		if m:
+		pass
+
+	# Attempt 2: extract first {...} block
+	m = re.search(r"\{.*?\}", text, re.DOTALL)
+	if m:
+		try:
 			return json.loads(m.group())
-		raise ValueError(f"LLM did not return valid JSON: {text[:200]}")
+		except json.JSONDecodeError:
+			pass
+
+	# Attempt 3: find the largest {...} block
+	m = re.search(r"\{.*\}", text, re.DOTALL)
+	if m:
+		try:
+			return json.loads(m.group())
+		except json.JSONDecodeError:
+			pass
+
+	# Attempt 4: heuristic — if text mentions a URL, treat as navigate
+	url_m = re.search(r'https?://[^\s"\']+', text)
+	if url_m:
+		return {"type": "navigate", "url": url_m.group()}
+
+	raise ValueError(f"LLM did not return valid JSON: {text[:300]}")
+
+
+async def _ask_llm_with_retry(llm, task, step, max_steps, page_state, history, max_retries=3):
+	"""Retry on 503 / rate-limit errors with exponential back-off."""
+	import asyncio as _asyncio
+	for attempt in range(max_retries):
+		try:
+			return await _ask_llm(llm, task, step, max_steps, page_state, history)
+		except Exception as exc:
+			msg = str(exc)
+			is_retryable = "503" in msg or "UNAVAILABLE" in msg or "rate" in msg.lower() or "quota" in msg.lower()
+			if is_retryable and attempt < max_retries - 1:
+				wait = 20 * (attempt + 1)  # 20s, 40s, 60s — matches Google's retry guidance
+				logger.warning("LLM 503/rate-limit (attempt %d/%d) — retrying in %ds", attempt + 1, max_retries, wait)
+				await _asyncio.sleep(wait)
+				continue
+			raise
 
 
 # ── Agent session ──────────────────────────────────────────────────────────────
@@ -202,7 +251,7 @@ async def _agent_loop(session: AgentSession):
 		# 2. Ask LLM for next action
 		session.push({"type": "thinking", "step": step, "url": page_state.get("url", "")})
 		try:
-			action = await _ask_llm(llm, session.task, step, session.max_steps, page_state, session.history)
+			action = await _ask_llm_with_retry(llm, session.task, step, session.max_steps, page_state, session.history)
 		except Exception as exc:
 			session.push({"type": "error", "message": f"LLM error: {exc}"})
 			session.status = "error"
